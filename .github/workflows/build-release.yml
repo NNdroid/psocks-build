@@ -1,0 +1,127 @@
+name: Daily Build and Package psocks
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 每天 UTC 02:00 (台北時間 10:00) 執行
+  workflow_dispatch: # 允許手動觸發
+
+jobs:
+  check_update:
+    name: Check for New Commits
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      sha: ${{ steps.get_remote.outputs.sha }}
+    steps:
+      - name: Get Remote Commit SHA
+        id: get_remote
+        run: |
+          SHA=$(git ls-remote https://codeberg.org/NNdroid/psocks.git HEAD | awk '{print $1}')
+          
+          if [ -z "$SHA" ]; then
+            echo "Error: Failed to fetch remote SHA."
+            exit 1
+          fi
+          
+          echo "sha=${SHA:0:7}" >> $GITHUB_OUTPUT
+      
+      - name: Check Existing Tags
+        id: check
+        run: |
+          TAG="v-${{ steps.get_remote.outputs.sha }}"
+          # 使用 git ls-remote 檢查當前 GitHub 倉庫是否已經 Push 過這個 Tag
+          if git ls-remote --tags https://github.com/${{ github.repository }}.git | grep -q "refs/tags/$TAG"; then
+            echo "Tag $TAG already exists. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Tag $TAG not found. Proceeding to build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Build and Package
+    needs: check_update
+    if: needs.check_update.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl    # 標準 Linux (64位)
+          - aarch64-unknown-linux-musl   # ARM64 (如樹莓派、新伺服器)
+          - armv7-unknown-linux-musleabihf # ARMv7 (如多數路由器)
+    steps:
+      - name: Clone Repository
+        run: git clone https://codeberg.org/NNdroid/psocks.git .
+
+      - name: Install Rust and Cross
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Cross tool
+        uses: taiki-e/install-action@cross
+
+      - name: Build Binary
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Create Package Bundle
+        run: |
+          mkdir -p release_stage
+          cp target/${{ matrix.target }}/release/psocks release_stage/
+          cp example/config.toml release_stage/
+          
+          tar -czvf psocks-${{ matrix.target }}.tar.gz -C release_stage .
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: psocks-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: [check_update, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # 必須先 checkout 你自己的倉庫，這樣 release 插件才能在你的倉庫打上 Tag 並 Push
+      - name: Checkout Local Repository
+        uses: actions/checkout@v4
+
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: ./dist
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Clone Upstream, Pack Source & Generate Release Notes
+        run: |
+          # 淺克隆最新的 10 個 commit
+          git clone --depth 10 https://codeberg.org/NNdroid/psocks.git repo
+          cd repo
+          
+          # 1. 使用 git archive 導出純淨源碼並打包（排除 .git 目錄）
+          git archive --format=tar.gz -o ../dist/psocks-source-${{ needs.check_update.outputs.sha }}.tar.gz HEAD
+          
+          # 2. 寫入 Release 說明
+          cat << 'EOF' > ../release_notes.md
+          自動檢查 Codeberg 更新並完成構建。
+          
+          ### 📦 包含的文件：
+          - 各架構的 `psocks` 執行檔與預設配置壓縮包
+          - `psocks-source-*.tar.gz` (上游純淨源碼)
+          
+          ### 🔄 最近更新記錄 (Upstream Commits)
+          EOF
+          
+          # 3. 獲取最近 10 條日誌追加到 markdown 中
+          git log -10 --pretty=format:"- [%h](https://codeberg.org/NNdroid/psocks/commit/%H) %s" >> ../release_notes.md
+
+      - name: Publish Release & Push Tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v-${{ needs.check_update.outputs.sha }}
+          name: "psocks 自動構建 - ${{ needs.check_update.outputs.sha }}"
+          body_path: ./release_notes.md
+          files: ./dist/*.tar.gz # 上傳 dist 目錄下的所有壓縮包（包含二進制與源碼）
